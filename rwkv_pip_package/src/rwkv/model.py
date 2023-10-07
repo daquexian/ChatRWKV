@@ -479,6 +479,8 @@ class RWKV(MyModule):
 
     @MyFunction
     def ffn_one(self, x, sx, ln_w, ln_b, k_mix, r_mix, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
+        if isinstance(sx, list):
+            sx = sx[-1]
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
         kx = xx * k_mix + sx * (1 - k_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
@@ -504,6 +506,8 @@ class RWKV(MyModule):
     @MyFunction
     def ffn_seq(self, x, sx, ln_w, ln_b, k_mix, r_mix, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        if isinstance(sx, list):
+            sx = sx[-1]
         sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
         kx = xx * k_mix + sx * (1 - k_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
@@ -511,7 +515,7 @@ class RWKV(MyModule):
         r = torch.sigmoid(gemm(rx, rw))
         vx = torch.square(torch.relu(gemm(kx, kw)))
         out = r * gemm(vx, vw)
-        return x + out, xx[-1,:]
+        return x + out, list(xx)
 
     @MyFunction
     def ffn_seq_i8(self, x, sx, ln_w, ln_b, k_mix, r_mix, kw, vw, rw, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry):
@@ -530,6 +534,14 @@ class RWKV(MyModule):
     @MyFunction
     def att_one(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        if isinstance(sx, list):
+            sx = sx[-1]
+        if isinstance(aa, list):
+            aa = aa[-1]
+        if isinstance(bb, list):
+            bb = bb[-1]
+        if isinstance(pp, list):
+            pp = pp[-1]
         kx = xx * k_mix + sx * (1 - k_mix)
         vx = xx * v_mix + sx * (1 - v_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
@@ -590,6 +602,9 @@ class RWKV(MyModule):
         v = gemm(vx, vw, output_dtype=torch.float32)
 
         T = x.shape[0]
+        all_a = []
+        all_b = []
+        all_p = []
         for t in range(T):
             kk = k[t]
             vv = v[t]
@@ -605,8 +620,11 @@ class RWKV(MyModule):
             aa = e1 * aa + e2 * vv
             bb = e1 * bb + e2
             pp = p
+            all_a.append(aa)
+            all_b.append(bb)
+            all_p.append(pp)
         out = gemm(r * sx, ow)
-        return x + out, xx[-1,:], aa, bb, pp
+        return x + out, list(xx), all_a, all_b, all_p
 
     @MyFunction
     def att_seq_i8(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
@@ -644,6 +662,10 @@ class RWKV(MyModule):
     @MyFunction
     def att_one_v5(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        if isinstance(sx, list):
+            sx = sx[-1]
+        if isinstance(s, list):
+            s = s[-1]
         kx = xx * k_mix + sx * (1 - k_mix)
         vx = xx * v_mix + sx * (1 - v_mix)
         rx = xx * r_mix + sx * (1 - r_mix)
@@ -669,6 +691,8 @@ class RWKV(MyModule):
     @MyFunction
     def att_seq_v5(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        if isinstance(sx, list):
+            sx = sx[-1]
         sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
         kx = xx * k_mix + sx * (1 - k_mix)
         vx = xx * v_mix + sx * (1 - v_mix)
@@ -695,15 +719,20 @@ class RWKV(MyModule):
         k = gemm(kx, kw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1).transpose(-2, -1)
         v = gemm(vx, vw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
 
+        if isinstance(s, list):
+            s = s[-1]
+
         out = ((r @ k) * w) @ v + (r @ s) * wb
-        s = ws * s + (k * wk) @ v
+        new_s = []
+        for i in range(T):
+            new_s.append(k[i:i+1] @ v[i:i+1] + t_decay * (s if i==0 else new_s[-1]))
         
         out = out.transpose(0, 1).contiguous().reshape(T, H*S)
         out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b)
         out = out.to(dtype=x.dtype)
         out = gemm(out, ow)
 
-        return x + out, xx[-1,:], s
+        return x + out, list(xx), new_s
 
     ########################################################################################################
 
