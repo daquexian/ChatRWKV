@@ -592,6 +592,14 @@ class RWKV(MyModule):
     @MyFunction
     def att_seq(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+        if isinstance(sx, list):
+            sx = sx[-1]
+        if isinstance(aa, list):
+            aa = aa[-1]
+        if isinstance(bb, list):
+            bb = bb[-1]
+        if isinstance(pp, list):
+            pp = pp[-1]
         sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
         kx = xx * k_mix + sx * (1 - k_mix)
         vx = xx * v_mix + sx * (1 - v_mix)
@@ -794,6 +802,8 @@ class RWKV(MyModule):
         v = gemm(vx, vw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
         g = F.silu(gemm(gx, gw))
 
+        # Or: out = r @ (w * k @ v + s * wb)
+        # Or: out = r @ (w * a + s * wb)
         out = ((r @ k) * w) @ v + (r @ s) * wb
         s = ws * s + (k * wk) @ v
         
@@ -838,6 +848,14 @@ class RWKV(MyModule):
     if os.environ["RWKV_CUDA_ON"] == '1':
         @MyFunction
         def cuda_att_seq(self, x, sx, aa, bb, pp, ln_w, ln_b, k_mix, v_mix, r_mix, t_decay, t_first, kw, vw, rw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
+            if isinstance(sx, list):
+                sx = sx[-1]
+            if isinstance(aa, list):
+                aa = aa[-1]
+            if isinstance(bb, list):
+                bb = bb[-1]
+            if isinstance(pp, list):
+                pp = pp[-1]
             T, C = x.shape
             xx = F.layer_norm(x, (C,), weight=ln_w, bias=ln_b)
             sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
