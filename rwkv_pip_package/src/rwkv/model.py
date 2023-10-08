@@ -402,8 +402,7 @@ class RWKV(MyModule):
                 prxxx(f'Converted and saved. Now this will exit.')
                 exit(0)
             
-            if self.version == 5.2:
-                assert os.environ["RWKV_CUDA_ON"] == '1' # latest RWKV-5 requires os.environ["RWKV_CUDA_ON"] == '1' (will fix soon)
+            if self.version == 5.2 and os.environ["RWKV_CUDA_ON"] == '1':
                 HEAD_SIZE = args.n_att // args.n_head
                 rwkv5 = load(name="rwkv5", sources=[f"{current_path}/cuda/rwkv5_op.cpp", f"{current_path}/cuda/rwkv5.cu"],
                                 verbose=True, extra_cuda_cflags=["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3" if os.name != "nt" else "", "--extra-device-vectorization", f"-D_N_={HEAD_SIZE}"])
@@ -816,6 +815,7 @@ class RWKV(MyModule):
 
     ########################################################################################################
 
+    @MyFunction
     def att_seq_v5_2(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
         xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
         sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
@@ -825,18 +825,24 @@ class RWKV(MyModule):
         gx = xx * g_mix + sx * (1 - g_mix)
 
         H = t_decay.shape[0]
-        N = x.shape[-1] // H
+        S = x.shape[-1] // H
         T = x.shape[0]
 
-        r = gemm(rx, rw, output_dtype=torch.float32)
-        k = gemm(kx, kw, output_dtype=torch.float32)
-        v = gemm(vx, vw, output_dtype=torch.float32)
+        r = gemm(rx, rw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
+        k = gemm(kx, kw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1).transpose(-2, -1)
+        v = gemm(vx, vw, output_dtype=torch.float32).view(T, H, S).transpose(0, 1)
         g = F.silu(gemm(gx, gw))
 
-        out, s = self.RUN_RWKV_5(1, T, self.args.n_att, H, s.transpose(-1,-2).contiguous(), r, k, v, w=t_decay, u=t_first)
-        s = s.transpose(-1,-2)
+        out = torch.empty((T, H, S), dtype=r.dtype, device=r.device)
+        for t in range(T):
+            rt = r[:,t:t+1,:]
+            kt = k[:,:,t:t+1]
+            vt = v[:,t:t+1,:]
+            at = gemm(kt, vt)
+            out[t] = (rt @ (t_first * at + s)).squeeze(1)
+            s = at + t_decay * s
 
-        out = out.reshape(T, H*N)
+        out = out.reshape(T, H*S)
         out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b)
         out = out.to(dtype=x.dtype) * g
         out = gemm(out, ow)
@@ -888,6 +894,35 @@ class RWKV(MyModule):
             out = self.mm8_seq(r * y, ow, omx, orx, omy, ory)
             return x + out, xx[-1,:], aa, bb, pp
 
+        # NOTE: decorate with @MyFunction causes JIT error
+        def cuda_att_seq_v5_2(self, x, sx, s, ln_w, ln_b, lx_w, lx_b, k_mix, v_mix, r_mix, g_mix, t_decay, t_first, kw, vw, rw, gw, ow, kmx, krx, kmy, kry, vmx, vrx, vmy, vry, rmx, rrx, rmy, rry, omx, orx, omy, ory):
+            xx = F.layer_norm(x, (x.shape[-1],), weight=ln_w, bias=ln_b)
+            sx = torch.cat((sx.unsqueeze(0), xx[:-1,:]))
+            kx = xx * k_mix + sx * (1 - k_mix)
+            vx = xx * v_mix + sx * (1 - v_mix)
+            rx = xx * r_mix + sx * (1 - r_mix)
+            gx = xx * g_mix + sx * (1 - g_mix)
+
+            H = t_decay.shape[0]
+            N = x.shape[-1] // H
+            T = x.shape[0]
+
+            r = gemm(rx, rw, output_dtype=torch.float32)
+            k = gemm(kx, kw, output_dtype=torch.float32)
+            v = gemm(vx, vw, output_dtype=torch.float32)
+            g = F.silu(gemm(gx, gw))
+
+            out, s = self.RUN_RWKV_5(1, T, self.args.n_att, H, s.transpose(-1,-2).contiguous(), r, k, v, w=t_decay, u=t_first)
+            s = s.transpose(-1,-2)
+
+            out = out.reshape(T, H*N)
+            out = F.group_norm(out, num_groups=H, weight=lx_w, bias=lx_b)
+            out = out.to(dtype=x.dtype) * g
+            out = gemm(out, ow)
+
+            return x + out, xx[-1,:], s
+
+
     ########################################################################################################
 
     def forward(self, tokens, state, full_output=False):
@@ -930,7 +965,8 @@ class RWKV(MyModule):
                 atype = dd.atype
                 wtype = dd.wtype
                 if seq_mode:
-                    if 'cuda' in str(dev) and os.environ["RWKV_CUDA_ON"] == '1':
+                    cuda_applicable = os.environ["RWKV_CUDA_ON"] == '1' and 'cuda' in str(dev)
+                    if cuda_applicable:
                         ATT = self.cuda_att_seq if wtype != torch.uint8 else self.cuda_att_seq_i8
                     else:
                         ATT = self.att_seq if wtype != torch.uint8 else self.att_seq_i8
@@ -940,6 +976,8 @@ class RWKV(MyModule):
                         ATT = self.att_seq_v5_1
                     elif self.version == 5.2:
                         ATT = self.att_seq_v5_2
+                        if cuda_applicable:
+                            ATT = self.cuda_att_seq_v5_2
                     FFN = self.ffn_seq if wtype != torch.uint8 else self.ffn_seq_i8
                 else:
                     ATT = self.att_one if wtype != torch.uint8 else self.att_one_i8
